@@ -41,6 +41,24 @@ run_as_user() {
     fi
 }
 
+# Helper: Ensure gnome-keyring-daemon is dead
+ensure_keyring_dead() {
+    local target="$1"
+    local target_uid=$(id -u "$target")
+    # Try normal kill first
+    killall -q -u "$target" gnome-keyring-daemon 2>/dev/null || true
+    # Wait a bit for it to exit
+    for i in {1..5}; do
+        # Use -f to avoid the 15-character limit for process names
+        if ! pgrep -u "$target_uid" -f gnome-keyring-daemon >/dev/null; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    # Force kill if still alive
+    pkill -9 -f -u "$target_uid" gnome-keyring-daemon 2>/dev/null || true
+}
+
 # --- 3. Installation Mode (-i) ---
 if [[ "$1" == "-i" ]]; then
     if [ "$EUID" -ne 0 ]; then echo "Please run with sudo"; exit 1; fi
@@ -91,20 +109,57 @@ EOF
     chmod 755 "$GLOBAL_PATH"
     [ -x /usr/sbin/chcon ] && chcon -t bin_t "$GLOBAL_PATH" 2>/dev/null
 
-    echo "[*] Hooking into PAM stacks..."
     PAM_LINE="auth optional pam_exec.so expose_authtok $GLOBAL_PATH"
-    # Target GDM and TTY login specifically for Fedora/Ubuntu
-    for PAM_FILE in /etc/pam.d/gdm-password /etc/pam.d/login; do
-        if [ -f "$PAM_FILE" ] && ! grep -q "$GLOBAL_PATH" "$PAM_FILE"; then
-            # Insert before gnome_keyring to ensure we intercept the password
-            if grep -q "pam_gnome_keyring.so" "$PAM_FILE"; then
-                sed -i "/pam_gnome_keyring.so/i $PAM_LINE" "$PAM_FILE"
-            else
-                sed -i "/pam_unix.so/a $PAM_LINE" "$PAM_FILE"
-            fi
-            echo "[+] Injected into $PAM_FILE"
+
+    if command -v authselect >/dev/null; then
+        echo "[*] Detected authselect system. Configuring custom profile..."
+        
+        CURRENT_PROFILE=$(authselect current | grep 'Profile ID:' | cut -d: -f2 | xargs)
+        
+        if [[ "$CURRENT_PROFILE" != custom/* ]]; then
+            NEW_PROFILE="ke-unlock"
+            echo "[+] Creating custom profile 'custom/$NEW_PROFILE' based on '$CURRENT_PROFILE'..."
+            authselect create-profile "$NEW_PROFILE" -b "$CURRENT_PROFILE" --force
+            authselect select "custom/$NEW_PROFILE" --force
+            CURRENT_PROFILE="custom/$NEW_PROFILE"
         fi
-    done
+        
+        PROFILE_DIR="/etc/authselect/$CURRENT_PROFILE"
+        echo "[*] Modifying profile at $PROFILE_DIR..."
+        
+        for FILENAME in system-auth password-auth; do
+            FILE_PATH="$PROFILE_DIR/$FILENAME"
+            if [ -f "$FILE_PATH" ] && ! grep -q "$GLOBAL_PATH" "$FILE_PATH"; then
+                # Remove any old session-stack or duplicate entries first
+                sed -i "\|$GLOBAL_PATH|d" "$FILE_PATH"
+                
+                # Insert into auth stack
+                if grep -q "pam_gnome_keyring.so" "$FILE_PATH"; then
+                    sed -i "/pam_gnome_keyring.so/i $PAM_LINE" "$FILE_PATH"
+                else
+                    sed -i "/pam_unix.so/a $PAM_LINE" "$FILE_PATH"
+                fi
+                echo "[+] Updated $FILENAME in $CURRENT_PROFILE"
+            fi
+        done
+        
+        echo "[*] Applying authselect changes..."
+        authselect apply-changes
+    else
+        echo "[*] Manual PAM modification (legacy/non-authselect system)..."
+        # Target GDM and TTY login specifically
+        for PAM_FILE in /etc/pam.d/gdm-password /etc/pam.d/login; do
+            if [ -f "$PAM_FILE" ] && ! grep -q "$GLOBAL_PATH" "$PAM_FILE"; then
+                # Insert before gnome_keyring to ensure we intercept the password
+                if grep -q "pam_gnome_keyring.so" "$PAM_FILE"; then
+                    sed -i "/pam_gnome_keyring.so/i $PAM_LINE" "$PAM_FILE"
+                else
+                    sed -i "/pam_unix.so/a $PAM_LINE" "$PAM_FILE"
+                fi
+                echo "[+] Injected into $PAM_FILE"
+            fi
+        done
+    fi
 
     echo "[+] Installation complete. Log out and back in to test."
     exit 0
@@ -122,7 +177,7 @@ fi
 # --- 5. Execution Logic ---
 
 # 5.1 Kill GNOME Keyring so KeePassXC can claim the Secret Service (libsecret)
-killall -u "$(id 1000 -n -u)" gnome-keyring-daemon
+ensure_keyring_dead "$TARGET_USER"
 
 # 5.2 Auto Database Creation (If it doesn't exist yet)
 if [[ ! -f "$DB_PATH" ]]; then
@@ -149,16 +204,16 @@ if ! pgrep -u "$TARGET_UID" -x keepassxc >/dev/null; then
         systemd-run --uid="$TARGET_USER" --gid="$TARGET_GID" \
             --setenv="XDG_RUNTIME_DIR=/run/user/$TARGET_UID" \
             --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$TARGET_UID/bus" \
-            --setenv="XDG_SESSION_TYPE=wayland" \
             --setenv="KP_PASS=$PASSWORD" \
+            --setenv="KP_DB=$DB_PATH" \
+            --setenv="T_UID=$TARGET_UID" \
             bash -c '
-                # Redirect internal worker errors to the log
                 exec >> "/var/log/ke_pam.log" 2>&1
                 
-                # Wait for Wayland socket to appear (GNOME initialization)
+                # Wait for Wayland socket to appear
                 for i in {1..60}; do
-                    if [ -S "/run/user/'"$TARGET_UID"'/bus" ]; then
-                        W_SOCK=$(ls /run/user/'"$TARGET_UID"'/wayland-* 2>/dev/null | grep -v "\.lock" | head -n 1)
+                    if [ -S "/run/user/$T_UID/bus" ]; then
+                        W_SOCK=$(ls /run/user/$T_UID/wayland-* 2>/dev/null | grep -v "\.lock" | head -n 1)
                         if [ -n "$W_SOCK" ]; then
                             export WAYLAND_DISPLAY=$(basename "$W_SOCK")
                             export DISPLAY=:0
@@ -169,17 +224,13 @@ if ! pgrep -u "$TARGET_UID" -x keepassxc >/dev/null; then
                 done
                 
                 sleep 2
-                pkill -9 -u "'"$TARGET_UID"'" gnome-keyring-daemon 2>/dev/null || true
+                pkill -9 -f -u "$T_UID" gnome-keyring-daemon 2>/dev/null || true
                 
-                # Pass password via secure RAM disk to avoid pipe race conditions
-                TMP_PASS="/dev/shm/kp_pam_tmp_'"$TARGET_UID"'"
+                TMP_PASS="/dev/shm/kp_pam_tmp_$T_UID"
                 echo "$KP_PASS" > "$TMP_PASS" && chmod 600 "$TMP_PASS"
-                
-                # Clean up the RAM file in 5 seconds
                 (sleep 5; rm -f "$TMP_PASS") &
                 
-                # Exec replaces bash with KeePassXC, keeping the process alive in systemd
-                exec keepassxc --minimized --pw-stdin "'"$DB_PATH"'" < "$TMP_PASS"
+                exec keepassxc --minimized --pw-stdin "$KP_DB" < "$TMP_PASS"
             ' &
     else
         # Shell/Interactive Context
