@@ -1,0 +1,2 @@
+1- Add hooks, when the screen is locked, and the user requires rentering the password into gnome, it should go to that current user dbus, and request lokcing the master.db, do not hook into that fading start, only after the profile is ensured locked
+2- Ensure hooks run when the user enters the password, either at session start, or after screen faded and locked!
