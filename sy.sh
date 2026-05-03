@@ -218,6 +218,7 @@ cat <<EOF >> "$FILTER_TEMP_FILE"
 - **/storage/default/**
 - **/startupCache/**
 - **/thumbnails/**
+- **/*-journal/**
 
 # ==========================================
 # --- 3. DÉVELOPPEMENT (NODE/PHP/VUE) ---
